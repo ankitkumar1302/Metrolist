@@ -112,7 +112,7 @@ import com.metrolist.music.utils.enumPreference
 import com.metrolist.music.utils.get
 import com.metrolist.music.utils.isInternetAvailable
 import com.metrolist.music.utils.reportException
-import com.metrolist.music.utils.NetworkConnectivity
+import com.metrolist.music.utils.NetworkConnectivityObserver
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -175,7 +175,7 @@ class MusicService :
     private val binder = MusicBinder()
 
     private lateinit var connectivityManager: ConnectivityManager
-    lateinit var connectivityObserver: NetworkConnectivity
+    lateinit var connectivityObserver: NetworkConnectivityObserver
     val waitingForNetworkConnection = MutableStateFlow(false)
     private val isNetworkConnected = MutableStateFlow(false)
 
@@ -288,15 +288,18 @@ class MusicService :
         controllerFuture.addListener({ controllerFuture.get() }, MoreExecutors.directExecutor())
 
         connectivityManager = getSystemService()!!
-        connectivityObserver = NetworkConnectivity(this)
+        connectivityObserver = NetworkConnectivityObserver(this)
 
         scope.launch {
             connectivityObserver.networkStatus.collect { isConnected ->
                 isNetworkConnected.value = isConnected
                 if (isConnected && waitingForNetworkConnection.value) {
+                    // Simple auto-play logic like OuterTune
                     waitingForNetworkConnection.value = false
-                    player.prepare()
-                    player.play()
+                    if (player.currentMediaItem != null && player.playWhenReady) {
+                        player.prepare()
+                        player.play()
+                    }
                 }
             }
         }
@@ -315,8 +318,8 @@ class MusicService :
 
         currentSong.debounce(1000).collect(scope) { song ->
             updateNotification()
-            if (song != null) {
-                discordRpc?.updateSong(song)
+            if (song != null && player.playWhenReady && player.playbackState == Player.STATE_READY) {
+                discordRpc?.updateSong(song, player.currentPosition)
             } else {
                 discordRpc?.closeRPC()
             }
@@ -377,8 +380,10 @@ class MusicService :
                 discordRpc = null
                 if (key != null && enabled) {
                     discordRpc = DiscordRPC(this, key)
-                    currentSong.value?.let {
-                        discordRpc?.updateSong(it)
+                    if (player.playbackState == Player.STATE_READY && player.playWhenReady) {
+                        currentSong.value?.let {
+                            discordRpc?.updateSong(it, player.currentPosition)
+                        }
                     }
                 }
             }
@@ -919,6 +924,25 @@ class MusicService :
         if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
             currentMediaMetadata.value = player.currentMetadata
         }
+
+        // Discord RPC updates
+
+        // Update the Discord RPC activity if the player is playing
+        if (events.containsAny(Player.EVENT_IS_PLAYING_CHANGED)) {
+            if (player.isPlaying) {
+                currentSong.value?.let { song ->
+                    scope.launch {
+                        discordRpc?.updateSong(song, player.currentPosition)
+                    }
+                }
+            }
+            // Send empty activity to the Discord RPC if the player is not playing
+            else if (!events.containsAny(Player.EVENT_POSITION_DISCONTINUITY, Player.EVENT_MEDIA_ITEM_TRANSITION)){
+                scope.launch {
+                    discordRpc?.stopActivity()
+                }
+            }
+        }
     }
 
     override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
@@ -1161,6 +1185,7 @@ class MusicService :
             discordRpc?.closeRPC()
         }
         discordRpc = null
+        connectivityObserver.unregister()
         abandonAudioFocus()
         mediaSession.release()
         player.removeListener(this)
